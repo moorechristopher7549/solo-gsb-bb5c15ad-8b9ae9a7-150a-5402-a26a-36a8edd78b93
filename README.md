@@ -15,7 +15,8 @@ docker compose up --build
 - 健康检查：`GET http://localhost:8000/health`
 
 依赖安装与建表均在启动时自动完成：Compose 启动 Postgres 16 与 API 两个容器，
-API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` / `reveals`）。
+API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` /
+`reveals` / `deadline_extensions`）。
 两个容器均带 healthcheck，`docker compose ps` 中状态变为 `healthy` 即就绪。
 
 ## 承诺哈希方案
@@ -50,6 +51,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events` | 创建事件（commit_deadline 须在未来，reveal_deadline 须更晚） |
 | GET | `/events` | 事件列表（含状态与计数） |
 | GET | `/events/{id}` | 事件详情 |
+| POST | `/events/{id}/extend` | 在 commit 阶段延长两个截止时间（只延不缩，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
@@ -138,6 +140,52 @@ curl -s -X POST http://localhost:8000/events/conflicts \
 `{"generated_at": "...", "phases": ["commit", "reveal"], "count": 0, "segments": []}`。
 请求中的重复 ID 自动去重；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；非 UUID 返回 422。
 
+## 受约束的截止时间延长（`POST /events/{id}/extend`）
+
+事件进入揭示期前，可在 **commit 阶段**一次性延长两个截止时间。校验与更新在**单个数据库
+事务**中完成（同一事件加行锁串行化），**任何一条规则不满足都整体回滚，截止时间保持不变**：
+
+- 仅当事件仍处于 `commit` 阶段（now < 当前 `commit_deadline`）时允许；
+  进入 `reveal` / `closed` 后返回 `409 DEADLINE_EXTENSION_PHASE_CLOSED`；
+- 新 `commit_deadline` 必须**严格晚于**当前 `commit_deadline`；
+- 新 `reveal_deadline` 必须**严格晚于**当前 `reveal_deadline`，
+  且**严格晚于**新 `commit_deadline`——两个截止时间都**只能延长、不能缩短**；
+- 两个时间必须携带时区偏移（如 `...Z` 或 `...+08:00`，按绝对 UTC 时刻比较），
+  否则返回 422；`reason` 必填（1～500 字，不能为空白）；
+- 事件不存在返回 `404 EVENT_NOT_FOUND`，路径参数非 UUID 返回 422。
+
+响应同时给出**旧值、新值与 reason**（以及 `extended_at`）：
+
+```bash
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
+  -H 'Content-Type: application/json' \
+  -d '{"new_commit_deadline": "2030-01-01T03:00:00Z",
+       "new_reveal_deadline": "2030-01-01T04:00:00Z",
+       "reason": "评审需要更多收集时间"}'
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "old_commit_deadline": "2030-01-01T01:00:00Z",
+  "new_commit_deadline": "2030-01-01T03:00:00Z",
+  "old_reveal_deadline": "2030-01-01T02:00:00Z",
+  "new_reveal_deadline": "2030-01-01T04:00:00Z",
+  "reason": "评审需要更多收集时间",
+  "extended_at": "2030-01-01T00:30:00Z"
+}
+```
+
+**幂等**：延长成功后，以**完全相同**的两个新截止时间（按 UTC 绝对时刻，`Z` 与等价
+`+08:00` 写法视为相同）与 `reason` 重复提交，逐字段返回与首次相同的结果（旧值/新值/
+reason/`extended_at` 均以首次记录为准），不会产生第二次更新。可连续多次延长（每次的
+旧值即上一次的新值）；某次延长之后，仅与「当前截止时间一致」的那次成功请求可幂等重放。
+幂等重放即使在事件已进入 reveal/closed 阶段后提交也照常返回首次结果；非幂等的新请求在
+非 commit 阶段仍返回 409。
+
+每次成功延长都会写入 `deadline_extensions` 审计表（旧值/新值/reason/时间），并以
+`deadline_extended` 条目出现在该事件的可核验时间线中。
+
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
 在**单个数据库事务**中按输入顺序提交 1～100 个承诺哈希。服务端在写入前完成全部校验，
@@ -204,6 +252,9 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
+| 409 | `DEADLINE_EXTENSION_PHASE_CLOSED` | 在 reveal / closed 阶段请求延长截止时间 |
+| 422 | `DEADLINE_NOT_EXTENDED` | 新截止时间不晚于当前值（试图缩短，含相等） |
+| 422 | `INVALID_DEADLINE_ORDER` | 新 reveal_deadline 不晚于新 commit_deadline |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
 | 409 | `DUPLICATE_COMMITMENT` | 同一事件内重复的承诺哈希（单个提交端点） |
 | 409 | `BATCH_COMMITMENT_CONFLICT` | 批量提交存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type/hash） |
@@ -230,12 +281,14 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
-  models.py     # SQLAlchemy 模型（events / commitments / reveals）
+  models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
-tests/test_api.py        # 业务规则冒烟测试（SQLite + 模拟时钟）
-tests/test_conflicts.py  # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_api.py               # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_conflicts.py         # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_batch_commitments.py # 原子批量提交：逐项冲突、整体回滚与边界
+tests/test_extend_deadlines.py  # 截止时间延长：约束校验、阶段限制、幂等与时间线
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

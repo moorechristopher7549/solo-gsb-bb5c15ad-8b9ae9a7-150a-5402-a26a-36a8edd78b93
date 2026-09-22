@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
-from .models import Commitment, Event, Reveal
+from .models import Commitment, DeadlineExtension, Event, Reveal
 from .schemas import (
     COMMITMENT_HASH_PATTERN,
     CommitmentBatchCreate,
@@ -29,6 +29,8 @@ from .schemas import (
     CommitmentOut,
     ConflictRequest,
     ConflictsOut,
+    DeadlineExtensionCreate,
+    DeadlineExtensionOut,
     EventCreate,
     EventOut,
     HashOut,
@@ -200,6 +202,130 @@ def list_events(db: Session = Depends(get_db)):
 @app.get("/events/{event_id}", response_model=EventOut)
 def get_event(event_id: UUID, db: Session = Depends(get_db)):
     return event_out(get_event_or_404(db, event_id), db, now_utc())
+
+
+# --------------------------------------------------------------------------- #
+# 受约束的截止时间延长
+# --------------------------------------------------------------------------- #
+
+@app.post("/events/{event_id}/extend", response_model=DeadlineExtensionOut)
+def extend_event_deadlines(
+    event_id: UUID, payload: DeadlineExtensionCreate, db: Session = Depends(get_db)
+):
+    """在 commit 阶段延长事件的两个截止时间（只延不缩，单事务校验并更新）。
+
+    规则（任何一条不满足都整体失败、截止时间保持不变）：
+      - 仅当事件仍处于 commit 阶段（now < 当前 commit_deadline）时允许；
+        进入 reveal / closed 后返回 409 DEADLINE_EXTENSION_PHASE_CLOSED。
+      - 新 commit_deadline 必须严格晚于当前 commit_deadline；
+      - 新 reveal_deadline 必须严格晚于当前 reveal_deadline，
+        且严格晚于新 commit_deadline——两个截止时间都只能延长不能缩短。
+      - 时间必须携带时区偏移，否则由请求体校验返回 422；事件不存在返回 404。
+
+    幂等：延长成功后，以完全相同的「两个新截止时间 + reason」重复提交，
+    返回与首次完全一致的旧值/新值（以首次延长记录为准，不再次更新）。
+    """
+    now = now_utc()
+    new_commit_dl = as_utc(payload.new_commit_deadline)
+    new_reveal_dl = as_utc(payload.new_reveal_deadline)
+
+    # 行级锁串行化同一事件的并发延长（SQLite 测试库无 FOR UPDATE 语法）
+    if db.bind.dialect.name == "sqlite":
+        event = db.get(Event, event_id)
+    else:
+        event = db.get(Event, event_id, with_for_update=True)
+    if event is None:
+        db.rollback()
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {event_id} 不存在")
+
+    current_commit_dl = as_utc(event.commit_deadline)
+    current_reveal_dl = as_utc(event.reveal_deadline)
+    status = event_status(event, now)
+
+    # 幂等重放优先：找到「延长到同一组新值且 reason 相同」的成功记录。
+    # 用当前行值复核（当前值必须就是该记录写入的新值），防止旧请求冒充幂等。
+    prior = (
+        db.query(DeadlineExtension)
+        .filter(DeadlineExtension.event_id == event.id)
+        .order_by(DeadlineExtension.created_at.desc(), DeadlineExtension.id.desc())
+        .all()
+    )
+    for ext in prior:
+        if (
+            as_utc(ext.new_commit_deadline) == new_commit_dl
+            and as_utc(ext.new_reveal_deadline) == new_reveal_dl
+            and ext.reason == payload.reason
+            and current_commit_dl == new_commit_dl
+            and current_reveal_dl == new_reveal_dl
+        ):
+            result = DeadlineExtensionOut(
+                event_id=event.id,
+                old_commit_deadline=as_utc(ext.old_commit_deadline),
+                new_commit_deadline=as_utc(ext.new_commit_deadline),
+                old_reveal_deadline=as_utc(ext.old_reveal_deadline),
+                new_reveal_deadline=as_utc(ext.new_reveal_deadline),
+                reason=ext.reason,
+                extended_at=as_utc(ext.created_at),
+            )
+            db.rollback()  # 重放不产生任何写入；回滚并释放行锁
+            return result
+
+    if status != "commit":
+        db.rollback()
+        phase_hint = "揭示期已开始" if status == "reveal" else "事件已关闭"
+        raise api_error(
+            409,
+            "DEADLINE_EXTENSION_PHASE_CLOSED",
+            f"截止时间仅能在 commit 阶段延长（{phase_hint}，当前阶段 {status}），请求被拒绝",
+        )
+
+    if new_commit_dl <= current_commit_dl:
+        db.rollback()
+        raise api_error(
+            422,
+            "DEADLINE_NOT_EXTENDED",
+            f"新 commit_deadline {new_commit_dl.isoformat()} 必须严格晚于当前值 "
+            f"{current_commit_dl.isoformat()}，截止时间只能延长不能缩短",
+        )
+    if new_reveal_dl <= current_reveal_dl:
+        db.rollback()
+        raise api_error(
+            422,
+            "DEADLINE_NOT_EXTENDED",
+            f"新 reveal_deadline {new_reveal_dl.isoformat()} 必须严格晚于当前值 "
+            f"{current_reveal_dl.isoformat()}，截止时间只能延长不能缩短",
+        )
+    if new_reveal_dl <= new_commit_dl:
+        db.rollback()
+        raise api_error(
+            422,
+            "INVALID_DEADLINE_ORDER",
+            f"新 reveal_deadline {new_reveal_dl.isoformat()} 必须严格晚于新 commit_deadline "
+            f"{new_commit_dl.isoformat()}",
+        )
+
+    extension = DeadlineExtension(
+        event_id=event.id,
+        old_commit_deadline=current_commit_dl,
+        new_commit_deadline=new_commit_dl,
+        old_reveal_deadline=current_reveal_dl,
+        new_reveal_deadline=new_reveal_dl,
+        reason=payload.reason,
+    )
+    event.commit_deadline = new_commit_dl
+    event.reveal_deadline = new_reveal_dl
+    db.add(extension)
+    db.commit()  # 校验与更新在同一事务中：commit 失败则全部回滚、截止时间不变
+
+    return DeadlineExtensionOut(
+        event_id=event.id,
+        old_commit_deadline=as_utc(extension.old_commit_deadline),
+        new_commit_deadline=as_utc(extension.new_commit_deadline),
+        old_reveal_deadline=as_utc(extension.old_reveal_deadline),
+        new_reveal_deadline=as_utc(extension.new_reveal_deadline),
+        reason=extension.reason,
+        extended_at=as_utc(extension.created_at),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +637,27 @@ def get_timeline(event_id: UUID, db: Session = Depends(get_db)):
         .all()
     )
     reveals = {r.commitment_id: r for r in db.query(Reveal).filter(Reveal.event_id == event.id)}
+    extensions = (
+        db.query(DeadlineExtension)
+        .filter(DeadlineExtension.event_id == event.id)
+        .order_by(DeadlineExtension.created_at, DeadlineExtension.id)
+        .all()
+    )
+
+    for x in extensions:
+        entries.append(
+            {
+                "type": "deadline_extended",
+                "at": as_utc(x.created_at),
+                "detail": {
+                    "old_commit_deadline": as_utc(x.old_commit_deadline).isoformat(),
+                    "new_commit_deadline": as_utc(x.new_commit_deadline).isoformat(),
+                    "old_reveal_deadline": as_utc(x.old_reveal_deadline).isoformat(),
+                    "new_reveal_deadline": as_utc(x.new_reveal_deadline).isoformat(),
+                    "reason": x.reason,
+                },
+            }
+        )
 
     for c in commitments:
         entries.append(

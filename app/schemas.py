@@ -55,6 +55,37 @@ class EventOut(BaseModel):
     reveal_count: int
 
 
+class DeadlineExtensionCreate(BaseModel):
+    new_commit_deadline: datetime = Field(description="新提交截止时间（须含时区，建议 UTC；只能晚于当前值）")
+    new_reveal_deadline: datetime = Field(description="新揭示截止时间（须含时区，建议 UTC；只能晚于新的提交截止时间）")
+    reason: str = Field(min_length=1, max_length=500, description="延长原因（必填，1～500 字）")
+
+    @field_validator("new_commit_deadline", "new_reveal_deadline")
+    @classmethod
+    def must_be_timezone_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("截止时间必须携带时区偏移（建议使用 UTC，如 2030-01-01T00:00:00Z）")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_not_be_blank(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("延长原因不能为空")
+        return v
+
+
+class DeadlineExtensionOut(BaseModel):
+    event_id: UUID
+    old_commit_deadline: datetime
+    new_commit_deadline: datetime
+    old_reveal_deadline: datetime
+    new_reveal_deadline: datetime
+    reason: str
+    extended_at: datetime
+
+
 class CommitmentOut(BaseModel):
     id: UUID
     event_id: UUID

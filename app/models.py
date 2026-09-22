@@ -25,6 +25,28 @@ class Event(Base):
     commitments: Mapped[list["Commitment"]] = relationship(
         back_populates="event", cascade="all, delete-orphan"
     )
+    extensions: Mapped[list["DeadlineExtension"]] = relationship(
+        back_populates="event", cascade="all, delete-orphan"
+    )
+
+
+class DeadlineExtension(Base):
+    """commit 阶段的一次成功截止时间延长（审计记录 + 幂等键）。"""
+
+    __tablename__ = "deadline_extensions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("events.id", ondelete="CASCADE"), index=True
+    )
+    old_commit_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    new_commit_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    old_reveal_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    new_reveal_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    event: Mapped[Event] = relationship(back_populates="extensions")
 
 
 class Commitment(Base):
