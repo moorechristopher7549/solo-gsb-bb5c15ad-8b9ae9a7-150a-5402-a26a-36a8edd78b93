@@ -44,6 +44,23 @@ class Commitment(Base):
     reveal: Mapped[Optional["Reveal"]] = relationship(back_populates="commitment", uselist=False)
 
 
+class DeadlineExtension(Base):
+    """一次成功截止时间延长的审计记录（旧值/新值/原因），同时用于幂等重放判定。"""
+
+    __tablename__ = "deadline_extensions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("events.id", ondelete="CASCADE"), index=True
+    )
+    old_commit_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    old_reveal_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    new_commit_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    new_reveal_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Reveal(Base):
     __tablename__ = "reveals"
 

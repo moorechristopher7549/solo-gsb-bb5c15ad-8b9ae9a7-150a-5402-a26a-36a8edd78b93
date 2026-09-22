@@ -7,6 +7,12 @@ from pydantic import BaseModel, Field, field_validator
 COMMITMENT_HASH_PATTERN = r"^[0-9a-fA-F]{64}$"
 
 
+def require_timezone_aware(v: datetime) -> datetime:
+    if v.tzinfo is None or v.utcoffset() is None:
+        raise ValueError("截止时间必须携带时区偏移（建议使用 UTC，如 2030-01-01T00:00:00Z）")
+    return v
+
+
 class EventCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: Optional[str] = None
@@ -16,9 +22,7 @@ class EventCreate(BaseModel):
     @field_validator("commit_deadline", "reveal_deadline")
     @classmethod
     def must_be_timezone_aware(cls, v: datetime) -> datetime:
-        if v.tzinfo is None or v.utcoffset() is None:
-            raise ValueError("截止时间必须携带时区偏移（建议使用 UTC，如 2030-01-01T00:00:00Z）")
-        return v
+        return require_timezone_aware(v)
 
 
 class CommitmentCreate(BaseModel):
@@ -41,6 +45,27 @@ class CommitmentBatchCreate(BaseModel):
 class RevealCreate(BaseModel):
     original_text: str = Field(description="预测原文（UTF-8）")
     salt: str = Field(min_length=1, max_length=256, description="随机盐（UTF-8）")
+
+
+class DeadlineExtensionCreate(BaseModel):
+    commit_deadline: datetime = Field(description="新的提交截止时间（须含时区，建议 UTC）")
+    reveal_deadline: datetime = Field(description="新的揭示截止时间（须含时区，建议 UTC）")
+    reason: str = Field(min_length=1, max_length=500, description="延长原因（记录进审计与时间线）")
+
+    @field_validator("commit_deadline", "reveal_deadline")
+    @classmethod
+    def must_be_timezone_aware(cls, v: datetime) -> datetime:
+        return require_timezone_aware(v)
+
+
+class DeadlineExtensionOut(BaseModel):
+    event_id: UUID
+    old_commit_deadline: datetime
+    old_reveal_deadline: datetime
+    new_commit_deadline: datetime
+    new_reveal_deadline: datetime
+    reason: str
+    extended_at: datetime
 
 
 class EventOut(BaseModel):
@@ -81,7 +106,7 @@ class RevealOut(BaseModel):
 
 class TimelineEntry(BaseModel):
     seq: int
-    type: str  # event_created | commitment_submitted | reveal_accepted
+    type: str  # event_created | commitment_submitted | reveal_accepted | deadline_extended
     at: datetime
     detail: dict[str, Any]
 

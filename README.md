@@ -15,7 +15,8 @@ docker compose up --build
 - 健康检查：`GET http://localhost:8000/health`
 
 依赖安装与建表均在启动时自动完成：Compose 启动 Postgres 16 与 API 两个容器，
-API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` / `reveals`）。
+API 等待数据库健康检查后启动，并在启动时自动创建数据表（`events` / `commitments` /
+`reveals` / `deadline_extensions`）。
 两个容器均带 healthcheck，`docker compose ps` 中状态变为 `healthy` 即就绪。
 
 ## 承诺哈希方案
@@ -50,6 +51,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | POST | `/events` | 创建事件（commit_deadline 须在未来，reveal_deadline 须更晚） |
 | GET | `/events` | 事件列表（含状态与计数） |
 | GET | `/events/{id}` | 事件详情 |
+| POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
@@ -90,6 +92,65 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals \
 # 5. 获取可核验时间线（含原文与盐，任何人可重算哈希比对）
 curl -s http://localhost:8000/events/<EVENT_ID>/timeline
 ```
+
+## 受约束的截止时间延长（`POST /events/{id}/extend`）
+
+仅在 **commit 阶段**可由调用方延长事件窗口。请求体携带新的两个截止时间（**必须带
+时区**）与 `reason`，服务端在**单个事务**中完成全部校验与更新：
+
+- 仅允许在当前 commit 阶段调用；事件进入 reveal / closed 阶段返回
+  `409 EXTENSION_NOT_IN_COMMIT_PHASE`；
+- 新 `commit_deadline` 必须**严格晚于**当前 commit 截止时间；
+- 新 `reveal_deadline` 必须**严格晚于**新 `commit_deadline`，且不得早于当前 reveal
+  截止时间 —— **两个截止时间只能延长，不能缩短，也不能保持不变**；
+- 任何校验失败均回滚事务，**不改变截止时间**，也不写入任何记录；
+- 响应同时返回旧值、新值与 `reason`；每次成功延长都会写入审计表
+  `deadline_extensions`，并作为 `deadline_extended` 条目出现在事件时间线中
+  （时间线里的 `event_created` 始终展示创建时的原始截止时间）。
+
+```bash
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
+  -H 'Content-Type: application/json' \
+  -d '{"commit_deadline": "2030-01-01T06:00:00Z",
+       "reveal_deadline": "2030-01-02T06:00:00Z",
+       "reason": "数据源延迟，顺延提交与揭示窗口"}'
+```
+
+```json
+{
+  "event_id": "<EVENT_ID>",
+  "old_commit_deadline": "2030-01-01T00:00:00Z",
+  "old_reveal_deadline": "2030-01-02T00:00:00Z",
+  "new_commit_deadline": "2030-01-01T06:00:00Z",
+  "new_reveal_deadline": "2030-01-02T06:00:00Z",
+  "reason": "数据源延迟，顺延提交与揭示窗口",
+  "extended_at": "2030-01-01T00:05:00Z"
+}
+```
+
+**幂等重放**：对**最近一次成功延长**提交完全相同的请求（新 `commit_deadline`、新
+`reveal_deadline` 与 `reason` 三者均一致，按 UTC 时刻比较），无论间隔多久、服务端时钟
+是否已推进，都直接返回首次延长的同一结果，不重复写入。仅时间相同而 `reason` 不同不算
+重放，按普通请求校验（若当前值已未再延长，则收到 409，状态不变）。
+
+```bash
+# 与上一次成功延长完全一致 -> 200，返回与首次完全相同的结果（幂等）
+curl -s -X POST http://localhost:8000/events/<EVENT_ID>/extend \
+  -H 'Content-Type: application/json' \
+  -d '{"commit_deadline": "2030-01-01T06:00:00Z",
+       "reveal_deadline": "2030-01-02T06:00:00Z",
+       "reason": "数据源延迟，顺延提交与揭示窗口"}'
+```
+
+延长后可基于新窗口继续延长（连续延长时，旧值为上一次延长后的新值，链条完整记录在
+审计表与时间线中）。失败语义：
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 404 | `EVENT_NOT_FOUND` | 事件不存在 |
+| 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 事件已进入 reveal / closed 阶段 |
+| 409 | `INVALID_EXTENSION` | 新 commit 未晚于当前值，或新 reveal 未晚于新 commit / 当前 reveal（只延不缩） |
+| 422 | — | 时间格式非法、时间无时区、`reason` 缺失或为空、事件 ID 非 UUID |
 
 ## 事件窗口冲突分析（`POST /events/conflicts`）
 
@@ -204,6 +265,8 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
+| 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
+| 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
 | 409 | `DUPLICATE_COMMITMENT` | 同一事件内重复的承诺哈希（单个提交端点） |
 | 409 | `BATCH_COMMITMENT_CONFLICT` | 批量提交存在逐项冲突（`detail.conflicts` 给出每个冲突项的 index/type/hash） |
@@ -211,7 +274,7 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/commitments/batch \
 | 409 | `REVEAL_PHASE_CLOSED` | 逾期揭示（已过 reveal_deadline） |
 | 409 | `NO_MATCHING_COMMITMENT` | 原文 + 盐重算后不匹配任何承诺 |
 | 409 | `DUPLICATE_REVEAL` | 该承诺已被揭示（仅首次匹配生效） |
-| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制） |
+| 422 | — | 请求体格式校验失败（如哈希非 64 位十六进制、截止时间无时区、延长缺少 reason） |
 
 「仅首次匹配的揭示生效」由 `reveals.commitment_id` 唯一约束保证：并发揭示同一承诺时，
 后到者事务回滚并收到 `DUPLICATE_REVEAL`。
@@ -230,12 +293,13 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
-  models.py     # SQLAlchemy 模型（events / commitments / reveals）
+  models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
-tests/test_api.py        # 业务规则冒烟测试（SQLite + 模拟时钟）
-tests/test_conflicts.py  # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
+tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
